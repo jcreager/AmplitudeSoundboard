@@ -22,7 +22,6 @@
 using Amplitude.Models;
 using Amplitude.ViewModels;
 using ManagedBass;
-using ManagedBass.Mix;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -53,7 +52,6 @@ namespace Amplitude.Helpers
 
 
         private const long TIMER_MS = 100;
-        private const long TIMER_SLACK = 50;
         private readonly Timer timer = new(TIMER_MS)
         {
             AutoReset = true,
@@ -63,21 +61,32 @@ namespace Amplitude.Helpers
         {
             foreach (var track in CurrentlyPlaying.ToArray())
             {
-                track.CurrentPos += TIMER_MS * 0.001d;
-
-                if (track.LoopClip)
+                // Timer ticks are shared by all clips and need not coincide with
+                // their start times. Read the actual playback position instead
+                // of estimating elapsed audio from the number of ticks.
+                var position = Bass.ChannelGetPosition(track.BassStreamId);
+                if (position >= 0)
                 {
-                    if (track.ProgressPct == 1)
+                    track.CurrentPos = Bass.ChannelBytes2Seconds(track.BassStreamId, position);
+                }
+
+                if (Bass.ChannelIsActive(track.BassStreamId) == PlaybackState.Stopped)
+                {
+                    if (track.LoopClip)
                     {
                         track.CurrentPos = 0;
                         Bass.ChannelPlay(track.BassStreamId, true);
                     }
+                    else
+                    {
+                        // Only release a naturally ending clip after BASS has
+                        // finished playing it, including its playback buffer.
+                        StopPlaying(track.BassStreamId, 0, 0);
+                    }
                 }
-                // might be off by 50ms, but oh well
-                else if (track.CurrentPos + (TIMER_SLACK * 0.001d) >= track.Length - (track.FadeOutMilis * 0.001d))
+                else if (!track.LoopClip && track.FadeOutMilis > 0
+                    && track.RemainingMilis <= track.FadeOutMilis)
                 {
-                    var timeRemainingMilis = 1000 * (track.Length - track.CurrentPos - (TIMER_SLACK * 0.001d));
-                    var fadeOutDuration = timeRemainingMilis < track.FadeOutMilis ? timeRemainingMilis : track.FadeOutMilis;
                     StopPlaying(track.BassStreamId, track.RemainingMilis, track.FadeOutMilis);
                 }
             }
@@ -105,6 +114,58 @@ namespace Amplitude.Helpers
         public const int SAMPLE_RATE = 44100;
 
         private readonly object bass_lock = new();
+        private readonly Dictionary<string, string> deviceUids = new();
+        private DateTimeOffset lastPlayUtc;
+        private volatile bool recovering;
+
+        internal string DeviceSnapshot()
+        {
+            lock (bass_lock)
+            {
+                var devices = new List<string>();
+                for (int i = 1; Bass.GetDeviceInfo(i, out var info); i++)
+                    devices.Add($"{i}:{info.Driver}:{info.Name}:{info.IsEnabled}:{info.IsDefault}");
+                return string.Join("\n", devices);
+            }
+        }
+
+        // Called only while idle. Release this application's contexts, never
+        // the system devices or another application's microphone capture.
+        internal bool RecoverOutputs(IEnumerable<string> names)
+        {
+            lock (bass_lock)
+            {
+                if (CurrentlyPlaying.Any() || Queued.Any()) return false;
+                recovering = true;
+                try
+                {
+                    lock (streamsToFreeLock) _streamsToFree.Clear();
+                    var initialized = new List<int>();
+                    for (int i = 1; Bass.GetDeviceInfo(i, out var info); i++)
+                        if (info.IsInitialized) initialized.Add(i);
+                    foreach (int id in initialized)
+                    {
+                        Bass.CurrentDevice = id;
+                        Bass.Free();
+                    }
+                    bool ready = true;
+                    foreach (var name in names.Distinct())
+                    {
+                        var id = GetOutputPlayerByName(name);
+                        if (!id.HasValue || !EnsureOutput(id.Value)) ready = false;
+                    }
+                    return ready;
+                }
+                finally { recovering = false; }
+            }
+        }
+
+        private static bool EnsureOutput(int id)
+        {
+            if (!Bass.Init(id, SAMPLE_RATE) && Bass.LastError != Errors.Already) return false;
+            Bass.CurrentDevice = id;
+            return Bass.CurrentDevice == id && Bass.Start();
+        }
 
 
         public List<string> OutputDeviceListWithoutGlobal
@@ -112,7 +173,8 @@ namespace Amplitude.Helpers
             get
             {
                 var all = OutputDeviceListWithGlobal.ToList();
-                all.RemoveAt(0);
+                all.Remove(ISoundEngine.DEFAULT_DEVICE_NAME);
+                all.Remove("System default");
                 return all;
             }
         }
@@ -125,7 +187,7 @@ namespace Amplitude.Helpers
                 // Index 0 is "No Sound", so skip
                 for (int dev = 1; Bass.GetDeviceInfo(dev, out DeviceInfo info); dev++)
                 {
-                    devices.Add(info.Name);
+                    if (info.IsEnabled) devices.Add(info.Name);
                 }
                 return devices;
             }
@@ -143,15 +205,26 @@ namespace Amplitude.Helpers
                 return 1;
             }
 
-            if (OutputDeviceListWithoutGlobal.Contains(playerDeviceName))
+            lock (bass_lock)
             {
-                for (int n = 0; n < Bass.DeviceCount; n++)
+                var candidates = new List<(int Id, DeviceInfo Info)>();
+                for (int n = 1; Bass.GetDeviceInfo(n, out var info); n++)
                 {
-                    var info = Bass.GetDeviceInfo(n);
-                    if (playerDeviceName == info.Name)
-                    {
-                        return n;
-                    }
+                    if (info.IsEnabled) candidates.Add((n, info));
+                }
+                if (deviceUids.TryGetValue(playerDeviceName, out var uid))
+                {
+                    var known = candidates.FirstOrDefault(d => d.Info.Driver == uid);
+                    if (known.Id != 0) return known.Id;
+                    // A disconnected saved endpoint must not resolve to an
+                    // unrelated device that happens to have the same name.
+                    return null;
+                }
+                var match = candidates.FirstOrDefault(d => d.Info.Name == playerDeviceName);
+                if (match.Id != 0)
+                {
+                    if (!string.IsNullOrEmpty(match.Info.Driver)) deviceUids[playerDeviceName] = match.Info.Driver;
+                    return match.Id;
                 }
             }
             return null;
@@ -209,10 +282,16 @@ namespace Amplitude.Helpers
 
         public void Play(SoundClip source, bool fromQueue = false)
         {
+            if (recovering) return;
             var tempId = source.Id ?? source.AudioFilePath;
-            if (!fromQueue && ConfigManager.Config.StopAudioOnRepeatTrigger && ClipPlayingOrQueued(tempId))
+            if (!fromQueue && ClipPlayingOrQueued(tempId))
             {
-                StopAndRemoveFromQueue(tempId);
+                if (ConfigManager.Config.StopAudioOnRepeatTrigger)
+                {
+                    StopAndRemoveFromQueue(tempId);
+                }
+                // With repeat-to-stop disabled, let the existing playback finish
+                // rather than starting overlapping copies of the same clip.
                 return;
             }
 
@@ -221,7 +300,18 @@ namespace Amplitude.Helpers
                 return;
             }
 
-            foreach (OutputSettings settings in source.OutputSettingsFromProfile)
+            var outputs = source.OutputSettingsFromProfile.ToArray();
+            lock (bass_lock)
+            {
+                var now = DateTimeOffset.UtcNow;
+                // Some Bluetooth failures leave the device list unchanged.
+                // Reopen once on the first trigger after a quiet minute rather
+                // than keeping the headset artificially active with silence.
+                if (lastPlayUtc != default && now - lastPlayUtc > TimeSpan.FromMinutes(1) && !MacSession.IsLocked())
+                    RecoverOutputs(outputs.Select(s => s.DeviceName));
+                lastPlayUtc = now;
+            }
+            foreach (OutputSettings settings in outputs)
             {
                 Play(source.AudioFilePath, settings.Volume, source.Volume, settings.DeviceName, source.LoopClip, tempId, settings.FadeOutMilis, source.Name);
             }
@@ -245,17 +335,39 @@ namespace Amplitude.Helpers
             lock (bass_lock)
             {
                 // Init device
-                if (Bass.Init(devId.Value, SAMPLE_RATE) || Bass.LastError == Errors.Already)
+                bool initialized = EnsureOutput(devId.Value);
+                if (!initialized && !CurrentlyPlaying.Any(c => c.OutputDevice == playerDeviceName))
                 {
-                    Bass.CurrentDevice = devId.Value;
-                    int mixer = BassMix.CreateMixerStream(SAMPLE_RATE, 2, BassFlags.Default);
+                    if (Bass.GetDeviceInfo(devId.Value, out var device) && device.IsInitialized)
+                    {
+                        Bass.CurrentDevice = devId.Value;
+                        if (Bass.CurrentDevice == devId.Value) Bass.Free();
+                    }
+                    initialized = EnsureOutput(devId.Value);
+                }
+                if (initialized)
+                {
                     int stream = Bass.CreateStream(fileName);
 
                     Bass.ChannelSetAttribute(stream, ChannelAttribute.Volume, vol);
-                    BassMix.MixerAddChannel(mixer, stream, BassFlags.AutoFree | BassFlags.MixerChanDownMix);
-                    Bass.ChannelPlay(mixer);
 
-                    if (stream != 0)
+                    // Retry a failed start once with a fresh output context.
+                    // Ordinary streams already mix and resample in BASS; the
+                    // previous unused mixer also leaked a stream per trigger.
+                    bool started = stream != 0 && Bass.ChannelPlay(stream, false);
+                    if (!started && !CurrentlyPlaying.Any(c => c.OutputDevice == playerDeviceName))
+                    {
+                        if (stream != 0) Bass.StreamFree(stream);
+                        Bass.Free();
+                        if (EnsureOutput(devId.Value))
+                        {
+                            stream = Bass.CreateStream(fileName);
+                            Bass.ChannelSetAttribute(stream, ChannelAttribute.Volume, vol);
+                            started = stream != 0 && Bass.ChannelPlay(stream, false);
+                        }
+                    }
+
+                    if (started)
                     {
                         // Track active streams so they can be stopped
                         try
@@ -272,19 +384,22 @@ namespace Amplitude.Helpers
                                 fadeOutMilis
                                 );
 
+                            // A timer tick must not see a not-yet-started stream
+                            // as a naturally completed one.
                             lock (currentlyPlayingLock)
                             {
                                 CurrentlyPlaying.Add(track);
                             }
-                            Bass.ChannelPlay(stream, false);
                         }
                         catch (Exception)
                         {
+                            Bass.StreamFree(stream);
                             WindowManager.ShowErrorString(string.Format(Localization.Localizer.Instance["FileBadFormatString"], fileName));
                         }
                     }
                     else
                     {
+                        if (stream != 0) Bass.StreamFree(stream);
                         streamError = true;
                     }
                 }
@@ -335,6 +450,10 @@ namespace Amplitude.Helpers
         {
             if (fadeOutMilis == 0 || stopped)
             {
+                lock (streamsToFreeLock)
+                {
+                    _streamsToFree.Remove(handle);
+                }
                 Bass.StreamFree(handle);
                 lock (currentlyPlayingLock)
                 {
@@ -347,9 +466,17 @@ namespace Amplitude.Helpers
             }
             else
             {
-                int remainingFadeOut = (int)(remainingMilis < fadeOutMilis ? remainingMilis : fadeOutMilis);
-                Bass.ChannelSlideAttribute(handle, ChannelAttribute.Volume, 0, remainingFadeOut);
-                _streamsToFree.Add(handle, new StreamToFree(handle, DateTimeOffset.Now.ToUnixTimeMilliseconds() + remainingFadeOut));
+                lock (streamsToFreeLock)
+                {
+                    // Repeated timer ticks must not restart the same fade.
+                    if (_streamsToFree.ContainsKey(handle))
+                    {
+                        return;
+                    }
+                    int remainingFadeOut = (int)(remainingMilis < fadeOutMilis ? remainingMilis : fadeOutMilis);
+                    Bass.ChannelSlideAttribute(handle, ChannelAttribute.Volume, 0, remainingFadeOut);
+                    _streamsToFree.Add(handle, new StreamToFree(handle, DateTimeOffset.Now.ToUnixTimeMilliseconds() + remainingFadeOut));
+                }
             }
         }
 

@@ -40,6 +40,7 @@ namespace AmplitudeSoundboard
 {
     public class App : Application, INotifyPropertyChanged
     {
+        private SoundboardRecovery? soundboardRecovery;
         // Exposed for XAML data binding in App.axaml (FluentTheme accent color binding)
         public ThemeManager ThemeManager => Locator.Current.GetService<ThemeManager>()!;
 
@@ -111,6 +112,12 @@ namespace AmplitudeSoundboard
 
                 // Start the global keyboard hook now that the config is loaded
                 Locator.Current.GetService<IKeyboardHook>()!.StartHotkeys();
+#if MacOS
+                soundboardRecovery = new SoundboardRecovery(
+                    (MSoundEngine)Locator.Current.GetService<ISoundEngine>()!,
+                    Locator.Current.GetService<OutputProfileManager>()!);
+                desktop.Exit += (_, _) => soundboardRecovery.Dispose();
+#endif
 #if !DEBUG
 #if Windows
                 Task.Run(CleanupOldFiles);

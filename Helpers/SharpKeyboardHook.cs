@@ -53,6 +53,7 @@ namespace Amplitude.Helpers
         private readonly object hotkeyCallbacksLock = new();
 
         private static readonly SortedSet<KeyCode> keySet = new();
+        private readonly HashSet<KeyCode> pressedTriggerKeys = new();
         private readonly object keySetLock = new();
 
         public SharpKeyboardHook(Lazy<HotkeysManager> hotkeysManager, Lazy<SoundClipManager> soundClipManager, Lazy<WindowManager> windowManager, Lazy<ConfigManager> configManager)
@@ -123,12 +124,23 @@ namespace Amplitude.Helpers
 
         private void HandleHookEnabled(object? sender, HookEventArgs e)
         {
+            ClearPressedKeys();
             hookAvailable = true;
         }
 
         private void HandleHookDisabled(object? sender, HookEventArgs e)
         {
             hookAvailable = false;
+            ClearPressedKeys();
+        }
+
+        private void ClearPressedKeys()
+        {
+            lock (keySetLock)
+            {
+                keySet.Clear();
+                pressedTriggerKeys.Clear();
+            }
         }
 
         private void HandleHookFailure(Task task)
@@ -213,6 +225,7 @@ namespace Amplitude.Helpers
             lock (keySetLock)
             {
                 keySet.Remove(e.Data.KeyCode);
+                pressedTriggerKeys.Remove(e.Data.KeyCode);
             }
         }
 
@@ -234,6 +247,15 @@ namespace Amplitude.Helpers
             }
             else
             {
+                lock (keySetLock)
+                {
+                    // A held key generates repeated KeyPressed events. Trigger once,
+                    // and require its KeyReleased event before accepting another press.
+                    if (!pressedTriggerKeys.Add(keyCode))
+                    {
+                        return;
+                    }
+                }
                 ProcessHotkey(GetFriendlyKeyName(keyCode));
             }
 
