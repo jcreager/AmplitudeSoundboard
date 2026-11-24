@@ -45,6 +45,9 @@
  - In order to use hotkeys, Amplitude Soundboard must be given accessibility permission to control your computer. This can be done under `System Preferences -> Privacy & Security -> Accessibility`. A popup should take you directly to this option at application startup. Amplitude Soundboard will need to be restarted after granting permissions for hotkeys to start working.
 3. If you would like to play sound through an input device like a microphone, set up a program like [BlackHole](https://github.com/ExistentialAudio/BlackHole) and set the newly created virtual cable as your clip output device.
 
+For microphone and soundboard clips together in Zoom, see the
+[macOS OBS + BlackHole setup guide](ZOOM-SETUP.md).
+
 ### Linux *(x64)*
 1. Download and unzip [latest Linux build](https://github.com/dan0v/AmplitudeSoundboard/releases/latest/download/Amplitude_Soundboard-x86_64.AppImage) from the [Releases page](https://git.dan0v.com/AmplitudeSoundboard/releases/).
 2. Run executable (`Amplitude_Soundboard-x86_64.AppImage`).
